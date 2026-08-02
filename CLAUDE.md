@@ -1,10 +1,10 @@
 <!-- COCKPIT-NIGHTLY — maschinell erzeugt, siehe Stand-Stempel -->
 # Projektgedaechtnis "Carson-MCP-Servers" (CLAUDE.md / AGENTS.md — inhaltsgleich)
 
-STAND: 2026-08-01 03:00 | COMMIT: d00fab1
+STAND: 2026-08-02 03:04 | COMMIT: 7556be7
 
-**DELTA:** Alles, was nach Commit d00fab1 passiert ist, steht NICHT in dieser Datei.
-Fuer den Ist-Stand: `git log --oneline d00fab1..HEAD` und die juengsten Recaps /
+**DELTA:** Alles, was nach Commit 7556be7 passiert ist, steht NICHT in dieser Datei.
+Fuer den Ist-Stand: `git log --oneline 7556be7..HEAD` und die juengsten Recaps /
 Uebergabeberichte lesen. Diese Datei enthaelt nur LANGSAMES Wissen (Architektur,
 Konventionen, Pfade, Entscheidungen, Fallstricke) — keinen Tagesstand.
 
@@ -19,8 +19,8 @@ setzt die Nightly.
 ## Architektur
 
 - Zwei eigenständige MCP-Server (Python, FastMCP aus `mcp`, async `httpx`) — reine API-Wrapper, zustandslos, keine eigene Persistenz.
-- **`rag_mcp`** → Butler-Knowledge-Graph `127.0.0.1:8100`; live `:8101` nginx-Auth-Proxy, Header `X-RAG-Key` aus Env `RAG_KEY`, zentral in `_client()`. Tools: `rag_search|store|update|delete|projects|stats`; Suche via `/rag/context` ohne LLM-Call.
-- **`papierkram_mcp`** → `https://frankrath.papierkram.de/api/v1`, Bearer aus Env `PAPIERKRAM_TOKEN` (43 Zeichen). Repo 6 Tools, live 9 (+`list_articles`, `create_article`, `create_invoice_draft`).
+- **`rag_mcp`** → Butler-Knowledge-Graph `127.0.0.1:8100`; live `:8101` nginx-Auth-Proxy, Header `X-RAG-Key` aus Env `RAG_KEY`, zentral in `_client()`. Tools: `rag_search|store|update|delete|projects|stats`; Suche via `/api/v1/rag/context` ohne LLM-Call.
+- **`papierkram_mcp`** → `https://frankrath.papierkram.de/api/v1`, Bearer aus Env `PAPIERKRAM_TOKEN`. Repo 6 Tools, live 9 (+`list_articles`, `create_article`, `create_invoice_draft`).
 - Konsument: OpenClaw-Gateway (`~/.openclaw/openclaw.json`, `mcp.servers`). Transport im Repo `stdio`; live papierkram `streamable-http` auf `127.0.0.1:18792`.
 - `rag_mcp` hat keine eigene systemd-Unit — OpenClaw startet ihn als Subprozess.
 
@@ -30,6 +30,7 @@ setzt die Nightly.
 - `papierkram_mcp/server.py` — Einstiegspunkt Papierkram-Server (dito im Repo; live `streamable-http`)
 - `*/requirements.txt` — je `mcp` + `httpx`; je Modul eigenes `.venv/`
 - `README.md` — Setup, Restart-Befehl, Geschäftsregeln
+- `CLAUDE.md` / `AGENTS.md` — inhaltsgleiches Projektgedächtnis (Nightly)
 - Produktivbaum: `/home/frank/carson-workspace/mcp-servers`; kein Build, kein CI/CD
 
 ## Datenmodell-Kern
@@ -37,11 +38,11 @@ setzt die Nightly.
 **RAG-Node:** `type` ∈ `fact|decision|issue|pattern`; `content` (ohne Chat-Kontext verständlich); `project`; `source` hart `"carson"`; optional `category`+`key` (bei `fact` Pflicht); `notes`. Adressierung per `node_id`; Update → Re-Embedding; Antwort kann `duplicate_warning` tragen.
 
 **Papierkram-Entitäten:**
-- `expense/vouchers` — Eingangsbeleg: `creditor`→Lieferant, `line_items` mit `amount`/`vat_rate`, Zahlung via `/pay`
-- `contact/companies` — `supplier: true`
-- `income/invoices` — Ausgangsrechnung, `/pay`; live zusätzlich `income/propositions` (Stammartikel, aus Rechnungspositionen referenziert)
+- `expense/vouchers` — Eingangsbeleg: `creditor_id`→Lieferant, `line_items[]` mit `amount`/`vat_rate`, `voucher_date`, `provenance`; Zahlung via `POST …/{id}/pay`
+- `contact/companies` — Kontakte; Lieferant = `supplier: true`, Kunde = `customer: true`
+- `income/invoices` — Ausgangsrechnung, `/pay`, `/cancel`; live zusätzlich `income/propositions` (Stammartikel, aus Rechnungspositionen referenziert)
 
-**`SUPPLIER_MAP`** — harte ID-Zuordnung im Code (Hetzner 229, Anthropic 244, OpenAI 235, STRATO 65 …), in mehreren Docstrings dupliziert → bei Änderung alle Stellen synchron halten.
+**`SUPPLIER_MAP`** — harte ID-Zuordnung im Code (Hetzner 229, Anthropic 244, OpenAI 235, STRATO 65, Vodafone 241, O2 38, Cursor 256 …), in mehreren Docstrings dupliziert → bei Änderung alle Stellen synchron halten.
 
 ## Deploy / Betrieb
 
@@ -63,11 +64,11 @@ setzt die Nightly.
 ## Fallstricke & No-Gos
 
 - **Repo ≠ Produktion**: Dienst läuft einen uncommitteten Arbeitsbaum; immer prüfen, welchen Stand man liest.
-- **Nie `git add -A` / `commit -a`**: vier `.bak`-Dateien und `roadmap.yaml` sind untracked, nicht gitignored → Pfade explizit nennen.
+- **Nie `git add -A` / `commit -a`**: `.bak`-Dateien und `roadmap.yaml` sind untracked, nicht gitignored → Pfade explizit nennen.
 - **PDF-Upload**: `POST /expense/vouchers/{id}/documents`, nicht `/pdf` — falscher Pfad erzeugt stumme `documents:[]`-Einträge.
 - **`POST …/pay` unzuverlässig**: danach `GET /expense/vouchers/{id}` bis `state=="paid"` prüfen; bereits bezahlt → 422.
 - **Belegnummern-Race**: parallele POSTs können dieselbe Nummer erhalten; im Live-Code prozessweiter `asyncio.Lock` serialisiert.
 - **`EU_SUPPLIER_IDS` ist leer**: `provenance`-Zweig `"eu"` unerreichbar; Nicht-`non_eu`-Belege werden still als `domestic` gebucht.
 - **Storno**: `POST /income/invoices/{id}/cancel` (kein Body) → `state=canceled`; `DELETE /income/invoices/{id}` zerstört die Rechnung (204) — **nicht** für Storno verwenden.
 - **Fehlerstil uneinheitlich**: `capture_receipt` wirft `RuntimeError`; `create_article`/`create_invoice_draft` geben `{"ok": false, …}` zurück; `payment_term_id=19` ist undokumentierte Magic-Number.
-- **API-Kontingent 429**: bei erschöpftem Kontingent antworten alle Endpunkte (GET wie POST) mit 429; Watchdog-Timer häuft Aufrufe auf und kann Kontingent frühzeitig leeren.
+- **API-Kontingent 429**: erschöpftes Kontingent blockiert GET wie POST; `papierkram-mcp-healthcheck.timer` häuft Aufrufe auf und leert das Kontingent frühzeitig — Restart bei 429 hilft strukturell nicht.
