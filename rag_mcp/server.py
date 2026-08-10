@@ -7,7 +7,25 @@ import json
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-BUTLER_API = os.environ.get("BUTLER_API_URL", "http://127.0.0.1:8100")
+BUTLER_API = os.environ.get("BUTLER_API_URL", "http://127.0.0.1:8101")
+
+# Proxy-Schluessel aus der Umgebung (openclaw.json mcp.servers.rag.env, nie im Code).
+# Fehlt er, geht der Request bewusst trotzdem raus und laeuft in den 401-Zweig —
+# sichtbar im Log statt still am Auth vorbei.
+RAG_KEY = os.environ.get("RAG_KEY", "")
+
+
+def _client() -> httpx.AsyncClient:
+    """Client fuer jeden RAG-Request. EINE Quelle fuer Basis-URL und Auth-Header,
+    damit Lese- und Schreibweg nicht auseinanderlaufen — beide gehen ueber den
+    Auth-Proxy auf 8101, der ohne X-RAG-Key mit 401 antwortet.
+    """
+    return httpx.AsyncClient(
+        base_url=BUTLER_API,
+        timeout=30,
+        headers={"X-RAG-Key": RAG_KEY},
+    )
+
 
 mcp = FastMCP("rag", instructions="Butler Knowledge Graph (RAG) — 58.000+ Nodes")
 
@@ -18,7 +36,7 @@ async def rag_search(query: str, max_results: int = 5) -> str:
 
     Nutzt /rag/context (ohne LLM-Call, spart Kosten). Ergebnisse nach Score sortiert.
     """
-    async with httpx.AsyncClient(base_url=BUTLER_API, timeout=30) as client:
+    async with _client() as client:
         resp = await client.post(
             "/api/v1/rag/context",
             json={"query": query, "max_results": max_results},
@@ -58,7 +76,7 @@ async def rag_store(
     if notes is not None:
         payload["notes"] = notes
 
-    async with httpx.AsyncClient(base_url=BUTLER_API, timeout=30) as client:
+    async with _client() as client:
         resp = await client.post("/api/v1/rag/store", json=payload)
         resp.raise_for_status()
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
@@ -77,7 +95,7 @@ async def rag_update(
     if notes is not None:
         payload["notes"] = notes
 
-    async with httpx.AsyncClient(base_url=BUTLER_API, timeout=30) as client:
+    async with _client() as client:
         resp = await client.patch(f"/api/v1/rag/update/{node_id}", json=payload)
         resp.raise_for_status()
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
@@ -89,7 +107,7 @@ async def rag_delete(node_id: str) -> str:
 
     GESCHÄFTSREGEL: IMMER Frank fragen bevor gelöscht wird! Niemals eigenständig löschen.
     """
-    async with httpx.AsyncClient(base_url=BUTLER_API, timeout=30) as client:
+    async with _client() as client:
         resp = await client.delete(f"/api/v1/rag/delete/{node_id}")
         resp.raise_for_status()
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
@@ -98,7 +116,7 @@ async def rag_delete(node_id: str) -> str:
 @mcp.tool()
 async def rag_projects() -> str:
     """Liste aller Projekte im Knowledge Graph."""
-    async with httpx.AsyncClient(base_url=BUTLER_API, timeout=30) as client:
+    async with _client() as client:
         resp = await client.get("/api/v1/rag/projects")
         resp.raise_for_status()
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
@@ -107,7 +125,7 @@ async def rag_projects() -> str:
 @mcp.tool()
 async def rag_stats() -> str:
     """Graph-Statistiken: Anzahl Nodes nach Typ, Relationships, etc."""
-    async with httpx.AsyncClient(base_url=BUTLER_API, timeout=30) as client:
+    async with _client() as client:
         resp = await client.get("/api/v1/graph/stats")
         resp.raise_for_status()
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
