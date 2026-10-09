@@ -1,0 +1,4 @@
+- 2026-10-09 [96072f] Papierkram-Swagger (/api/v1/api-docs/api/v1/swagger.json) ist ohne Token per GET lesbar; POST /contact/companies verlangt name + contact_type (Enum customer|supplier).
+- 2026-10-09 [96072f] POST /expense/vouchers verlangt name, provenance (domestic|eu|foreign), line_items.
+- 2026-10-09 [96072f] papierkram_mcp/server.py braucht mcp 1.x (FastMCP); ungepinntes requirements.txt installiert mcp 2.x, dort fehlt mcp.server.fastmcp. Produktiv-venv: mcp 1.26.0.
+- 2026-10-09 [96072f] test_payloads.py importiert server.py über sys.path auf das eigene Verzeichnis; Aufruf aus dem Repo-Root mit papierkram_mcp/.venv/bin/python -m unittest papierkram_mcp/test_payloads.py -v.
