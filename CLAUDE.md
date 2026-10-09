@@ -38,7 +38,7 @@ setzt die Nightly.
 
 **Papierkram-Entitäten:**
 - `expense/vouchers` — `creditor_id`, `line_items[]` mit `amount` (brutto), `vat_rate`, `document_date`, `due_date`, `provenance`; `/documents` (PDF), `/pay`, `state`
-- `contact/companies` — `supplier: true` / `customer: true`
+- `contact/companies` — POST mit `contact_type` ∈ `customer|supplier` (Pflicht laut Swagger); Suche per Query `supplier=true` / `customer=true`
 - `income/invoices` — Draft, `/pay`, `/cancel`; `income/propositions` (Stammartikel, `per_page=100`, `record_state`)
 
 **`SUPPLIER_MAP`** (harte IDs): Hetzner 229, Anthropic 244, OpenAI 235, Perplexity 238, STRATO 65, Vodafone 241, O2 38, Cursor 256, Skool 232, Papierkram/Odacer 13, Freiraum24 259. `NON_EU_SUPPLIER_IDS={232,235,238,244,256}` → Code liefert `"foreign"` (nicht `"non_eu"`). Map in mehreren Docstrings dupliziert — bei Änderung alle Stellen synchron halten.
@@ -66,10 +66,10 @@ setzt die Nightly.
 - **Repo ≠ Produktion**: Produktivbaum kann unversionierte Änderungen enthalten; vor Edits Drift prüfen. Kein Direktpatch im Live-Checkout — CC-Jobs nur im Worktree.
 - **`fa7577d` rag_mcp-Auth-Änderung**: nie durch Verify-Kette geprüft — Inhalt unbestätigt.
 - **`create_invoice_draft`**: `payment_term_id=19` Magic-Number; berechnetes `due_date` wird nicht ins API-Payload übernommen.
-- **`provenance`**: `EU_SUPPLIER_IDS` leer → Zweig `"eu"` unerreichbar; Nicht-`NON_EU`-Belege werden still als `"domestic"` gebucht.
+- **`provenance`**: optionaler Tool-Parameter (`domestic|eu|foreign`, sonst `ValueError`); ohne Angabe: Steuersatz > 0 % → `"domestic"`, bei 0 % Supplier-Map. `EU_SUPPLIER_IDS` leer → `"eu"` nur explizit erreichbar.
 - **PDF-Upload**: `POST /expense/vouchers/{id}/documents`, nicht `/pdf`.
 - **`POST …/pay` unzuverlässig**: danach `GET` bis `state=="paid"` pollen; bereits bezahlt → 422.
 - **Belegnummern-Race**: `_voucher_create_lock` (asyncio.Lock) serialisiert parallele POSTs — nicht entfernen.
 - **Storno**: `POST /income/invoices/{id}/cancel`; `DELETE` zerstört die Rechnung — nicht für Storno verwenden.
-- **Fehlerstil uneinheitlich**: `capture_receipt` wirft `RuntimeError`; andere geben `{"ok": false}`.
+- **Fehlerstil uneinheitlich**: `capture_receipt`/`create_supplier` werfen `RuntimeError(_error_payload)`; andere geben `{"ok": false}` oder `raise_for_status()`.
 - **API-Kontingent 429**: blockiert GET wie POST; Healthcheck-Timer häuft Aufrufe auf; Restart hilft strukturell nicht.

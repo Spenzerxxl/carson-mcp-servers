@@ -91,6 +91,63 @@ def _provenance_for_supplier(supplier_id: int) -> str:
     return "domestic"
 
 
+VALID_PROVENANCES = {"domestic", "eu", "foreign"}
+
+
+def _resolve_provenance(
+    supplier_id: int, normalized_vat_rate: str, provenance: str | None = None
+) -> str:
+    # Expliziter Wert gewinnt, muss aber ein API-Enum-Wert sein (kein "non_eu").
+    if provenance is not None:
+        if provenance not in VALID_PROVENANCES:
+            raise ValueError(
+                f"Ungültige provenance: {provenance!r} "
+                f"(erlaubt: {', '.join(sorted(VALID_PROVENANCES))})"
+            )
+        return provenance
+    # Beleg mit Steuer > 0 % wird als Inland gebucht, unabhängig vom Lieferanten:
+    # "foreign" + 19 % lieferte am 09.10.2026 422 "Steuer muss ausgewählt werden"
+    # (Anthropic-Rechnung mit deutscher USt).
+    if normalized_vat_rate != "0%":
+        return "domestic"
+    return _provenance_for_supplier(supplier_id)
+
+
+def _supplier_payload(name: str) -> dict:
+    return {"name": name, "contact_type": "supplier"}
+
+
+def _receipt_payload(
+    name: str,
+    supplier_id: int,
+    amount_gross: float,
+    vat_rate: str,
+    date: str,
+    due_date: str,
+    category: str,
+    provenance: str | None = None,
+) -> dict:
+    normalized_vat_rate = _normalize_vat_rate(vat_rate)
+    # WICHTIG: Papierkram erwartet im line_item "amount" den BRUTTObetrag.
+    # Frueher wurde hier faelschlich in Netto umgerechnet (Bug: Belege wie
+    # B-00409/B-00410 wurden mit Nettobetrag angelegt). NICHT umrechnen!
+    return {
+        "name": name,
+        "creditor": {"id": supplier_id},
+        "document_date": date,
+        "due_date": due_date,
+        "line_items": [
+            {
+                "name": name,
+                "amount": _rounded_amount(amount_gross),
+                "vat_rate": normalized_vat_rate,
+                "category": category,
+            }
+        ],
+        "provenance": _resolve_provenance(supplier_id, normalized_vat_rate, provenance),
+    }
+
+
 def _error_payload(resp: httpx.Response) -> str:
     try:
         detail = resp.json()
@@ -308,6 +365,7 @@ async def papierkram_capture_receipt(
     pdf_path: str | None = None,
     due_date: str | None = None,
     mark_paid: bool = False,
+    provenance: str | None = None,
 ) -> str:
     """Eingangsbeleg (Expense Voucher) erfassen.
 
@@ -330,32 +388,21 @@ async def papierkram_capture_receipt(
         pdf_path: Optionaler Pfad zur PDF-Datei
         due_date: Fälligkeitsdatum (YYYY-MM-DD). Default: date + 14 Tage.
         mark_paid: Als bezahlt markieren (default: false)
+        provenance: Herkunft des Belegs: "domestic", "eu" oder "foreign" (optional).
+            Andere Werte (z.B. "non_eu") werden vor dem API-Call mit ValueError
+            abgelehnt. Default ohne Angabe: Steuersatz > 0 % → "domestic"
+            (unabhängig vom Lieferanten), bei 0 % der Wert aus der Supplier-Map
+            (NON_EU-Lieferanten → "foreign", sonst "domestic").
     """
     if due_date is None:
         due_date = (
             datetime.strptime(date, "%Y-%m-%d") + timedelta(days=14)
         ).strftime("%Y-%m-%d")
 
-    normalized_vat_rate = _normalize_vat_rate(vat_rate)
-    # WICHTIG: Papierkram erwartet im line_item "amount" den BRUTTObetrag.
-    # Frueher wurde hier faelschlich in Netto umgerechnet (Bug: Belege wie
-    # B-00409/B-00410 wurden mit Nettobetrag angelegt). NICHT umrechnen!
-    line_item_amount = _rounded_amount(amount_gross)
-    payload = {
-        "name": name,
-        "creditor": {"id": supplier_id},
-        "document_date": date,
-        "due_date": due_date,
-        "line_items": [
-            {
-                "name": name,
-                "amount": line_item_amount,
-                "vat_rate": normalized_vat_rate,
-                "category": category,
-            }
-        ],
-        "provenance": _provenance_for_supplier(supplier_id),
-    }
+    payload = _receipt_payload(
+        name, supplier_id, amount_gross, vat_rate, date, due_date, category, provenance
+    )
+    line_item_amount = payload["line_items"][0]["amount"]
 
     async with _voucher_create_lock, httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -459,9 +506,10 @@ async def papierkram_create_supplier(name: str) -> str:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/contact/companies",
             headers=_headers(),
-            json={"name": name, "supplier": True},
+            json=_supplier_payload(name),
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            raise RuntimeError(_error_payload(resp))
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
 
 
