@@ -1,10 +1,10 @@
 <!-- COCKPIT-NIGHTLY — maschinell erzeugt, siehe Stand-Stempel -->
 # Projektgedaechtnis "Carson-MCP-Servers" (CLAUDE.md / AGENTS.md — inhaltsgleich)
 
-STAND: 2026-10-10 03:00 | COMMIT: bb54d66
+STAND: 2026-10-20 08:10 | COMMIT: b6cf6ad
 
-**DELTA:** Alles, was nach Commit bb54d66 passiert ist, steht NICHT in dieser Datei.
-Fuer den Ist-Stand: `git log --oneline bb54d66..HEAD` und die juengsten Recaps /
+**DELTA:** Alles, was nach Commit b6cf6ad passiert ist, steht NICHT in dieser Datei.
+Fuer den Ist-Stand: `git log --oneline b6cf6ad..HEAD` und die juengsten Recaps /
 Uebergabeberichte lesen. Diese Datei enthaelt nur LANGSAMES Wissen (Architektur,
 Konventionen, Pfade, Entscheidungen, Fallstricke) — keinen Tagesstand.
 
@@ -39,10 +39,10 @@ setzt die Nightly.
 
 **Papierkram-Entitäten:**
 - `expense/vouchers` — Pflichtfelder POST: `name`, `provenance`, `line_items[]`; `line_items.amount` = brutto, `vat_rate`; `/documents` (PDF-Upload), `/pay`, `state`
-- `contact/companies` — POST: `name` + `contact_type` ∈ `customer|supplier` (Pflicht lt. Swagger); Suche per `?supplier=true` / `?customer=true`
-- `income/invoices` — Draft, `/pay`, `/cancel`; `income/propositions` (Stammartikel, `per_page=100`, `record_state`)
+- `contact/companies` — POST: `name` + `contact_type` ∈ `customer|supplier`; Suche per `?supplier=true` / `?customer=true`
+- `income/invoices` — Draft, `/pay`, `/cancel`; `income/propositions` (Stammartikel, `per_page=100`)
 
-**`SUPPLIER_MAP`** (harte IDs): Hetzner 229, Anthropic 244, OpenAI 235, Perplexity 238, STRATO 65, Vodafone 241, O2 38, Cursor 256, Skool 232, Papierkram/Odacer 13, Freiraum24 259. `NON_EU_SUPPLIER_IDS={232,235,238,244,256}` → Code liefert `"foreign"`. Map in mehreren Docstrings dupliziert — bei Änderung alle Stellen synchron halten.
+**`SUPPLIER_MAP`** (harte IDs): Hetzner 229, Anthropic 244, OpenAI 235, Perplexity 238, STRATO 65, Vodafone 241, O2 38, Cursor 256, Skool 232, Papierkram/Odacer 13, Freiraum24 259. `NON_EU_SUPPLIER_IDS={232,235,238,244,256}` → `"foreign"`. Map in Docstrings dupliziert — bei Änderung alle Stellen synchron halten.
 
 ## Deploy / Betrieb
 
@@ -51,7 +51,6 @@ setzt die Nightly.
 - `~/.config/systemd/user/papierkram-mcp.service`; `papierkram-mcp-healthcheck.timer` (`OnCalendar=*:0/5`) → ~576 Aufrufe/Tag.
 - **Service-Restart immer manuell durch Frank** — `systemctl --user` in CC-Job-Sandboxes nicht erreichbar.
 - Debug: `curl 127.0.0.1:8100/api/v1/health`, `journalctl --user -u openclaw-gateway -f`
-- Swagger ohne Token lesbar: `GET /api/v1/api-docs/api/v1/swagger.json`
 
 ## Konventionen
 
@@ -65,9 +64,9 @@ setzt die Nightly.
 ## Fallstricke & No-Gos
 
 - **Repo ≠ Produktion**: vor Edits Drift prüfen; kein Direktpatch im Live-Checkout — CC-Jobs nur im Worktree.
-- **`fa7577d` rag_mcp-Auth-Änderung**: nie durch Verify-Kette geprüft.
+- **`fa7577d` rag_mcp-Auth-Änderung**: nie durch Verify-Kette geprüft — Inhalt unbestätigt.
 - **`create_invoice_draft`**: `payment_term_id=19` Magic-Number; berechnetes `due_date` nicht im API-Payload.
-- **`provenance`**: Tool-Parameter (`domestic|eu|foreign`, sonst `ValueError`); ohne Angabe: Steuersatz > 0 % → `"domestic"`, 0 % → Supplier-Map. `EU_SUPPLIER_IDS` leer → `"eu"` nur explizit erreichbar.
+- **`provenance`**: Pflichtparameter (`domestic|eu|foreign`, sonst `ValueError`); ohne Angabe: Steuersatz > 0 % → `"domestic"`, 0 % → Supplier-Map. `EU_SUPPLIER_IDS` leer → `"eu"` nur explizit erreichbar.
 - **PDF-Upload**: `POST /expense/vouchers/{id}/documents`, nicht `/pdf`.
 - **`POST …/pay` unzuverlässig**: danach `GET` bis `state=="paid"` pollen; bereits bezahlt → 422.
 - **Belegnummern-Race**: `_voucher_create_lock` (asyncio.Lock) serialisiert parallele POSTs — nicht entfernen.
@@ -77,6 +76,6 @@ setzt die Nightly.
 
 ## Gelernte Regeln
 
-- `mcp` in `requirements.txt` auf 1.x pinnen (Produktiv-venv: 1.26.0); ungepinnt installiert 2.x, dort fehlt `mcp.server.fastmcp`.
-- Vor POST `/contact/companies` und `/expense/vouchers` Swagger prüfen — Pflichtfelder können sich ändern; Swagger per GET ohne Token lesbar.
-[auf Ziellaenge gekuerzt]
+- `mcp` in `requirements.txt` auf `<2` pinnen; ungepinnt installiert 2.x, dort fehlt `mcp.server.fastmcp`.
+- Vor POST `/contact/companies` Swagger prüfen: `name` + `contact_type` (`customer|supplier`) sind Pflicht. Swagger per `GET /api/v1/api-docs/api/v1/swagger.json` ohne Token lesbar — vor POSTs Pflichtfelder prüfen.
+- `test_payloads.py` importiert `server.py` über `sys.path`; immer aus dem Repo-Root mit dem Modul-eigenen `.venv/bin/python` aufrufen.
