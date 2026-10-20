@@ -21,7 +21,7 @@ SUPPLIER_MAP = {
     "openai": 235,
     "perplexity": 238,
     "strato": 65,
-    "vodafone": 241,
+    "vodafone": 226,
     "o2": 38,
     "cursor": 256,
     "skool": 232,
@@ -46,6 +46,19 @@ def _headers() -> dict:
         "Authorization": f"Bearer {PAPIERKRAM_TOKEN}",
         "Content-Type": "application/json",
     }
+
+
+_MARK_PAID_AUS_WERTE = {"0", "false", "nein", "no", "off"}
+
+
+def _mark_paid_erlaubt() -> bool:
+    """Schalter PAPIERKRAM_MARK_PAID_ERLAUBT — erst beim Aufruf gelesen.
+
+    Nicht gesetzt oder leer → an. "0", "false", "nein", "no", "off"
+    (Groß-/Kleinschreibung egal) → aus.
+    """
+    wert = os.environ.get("PAPIERKRAM_MARK_PAID_ERLAUBT", "").strip().lower()
+    return wert not in _MARK_PAID_AUS_WERTE
 
 
 def _normalize_vat_rate(vat_rate: str) -> str:
@@ -375,7 +388,7 @@ async def papierkram_capture_receipt(
     Beträge immer in Euro mit 2 Dezimalstellen.
 
     Bekannte Lieferanten-IDs: Hetzner=229, Anthropic=244, OpenAI=235,
-    Perplexity=238, STRATO=65, Vodafone=241, O2=38, Cursor=256,
+    Perplexity=238, STRATO=65, Vodafone=226, O2=38, Cursor=256,
     Skool=232, Papierkram/Odacer=13, Freiraum24=259.
 
     Args:
@@ -387,7 +400,8 @@ async def papierkram_capture_receipt(
         category: Papierkram-Kategorie (z.B. "Software/EDV (Büroartikel)")
         pdf_path: Optionaler Pfad zur PDF-Datei
         due_date: Fälligkeitsdatum (YYYY-MM-DD). Default: date + 14 Tage.
-        mark_paid: Als bezahlt markieren (default: false)
+        mark_paid: Als bezahlt markieren (default: false). Wird ignoriert, wenn
+            PAPIERKRAM_MARK_PAID_ERLAUBT aus ist (Ergebnis: mark_paid_ignoriert).
         provenance: Herkunft des Belegs: "domestic", "eu" oder "foreign" (optional).
             Andere Werte (z.B. "non_eu") werden vor dem API-Call mit ValueError
             abgelehnt. Default ohne Angabe: Steuersatz > 0 % → "domestic"
@@ -425,7 +439,13 @@ async def papierkram_capture_receipt(
                 result["pdf_upload_status"] = upload_resp.status_code
                 result["pdf_uploaded"] = upload_resp.is_success
 
-        if mark_paid and "id" in result:
+        if mark_paid and "id" in result and not _mark_paid_erlaubt():
+            result["mark_paid_ignoriert"] = True
+            result["hinweis"] = (
+                "PAPIERKRAM_MARK_PAID_ERLAUBT ist aus — Beleg wurde angelegt, "
+                "aber NICHT als bezahlt markiert."
+            )
+        elif mark_paid and "id" in result:
             pay_value = _rounded_amount(result.get("amount", line_item_amount))
             pay_resp = await client.post(
                 f"{PAPIERKRAM_URL}/expense/vouchers/{result['id']}/pay",
@@ -482,7 +502,7 @@ async def papierkram_search_supplier(query: str) -> str:
 
     Durchsucht die Papierkram-Kontaktdatenbank nach Lieferanten.
     Bekannte Lieferanten-IDs: Hetzner=229, Anthropic=244, OpenAI=235,
-    Perplexity=238, STRATO=65, Vodafone=241, O2=38, Cursor=256,
+    Perplexity=238, STRATO=65, Vodafone=226, O2=38, Cursor=256,
     Skool=232, Papierkram/Odacer=13, Freiraum24=259.
     """
     async with httpx.AsyncClient(timeout=30) as client:
@@ -528,6 +548,11 @@ async def papierkram_mark_paid(
         payment_date: Zahlungsdatum (YYYY-MM-DD)
         amount: Bezahlter Betrag in Euro
     """
+    if not _mark_paid_erlaubt():
+        raise RuntimeError(
+            "papierkram_mark_paid gesperrt: PAPIERKRAM_MARK_PAID_ERLAUBT ist aus — "
+            "keine Zahlung gebucht, API nicht aufgerufen."
+        )
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/income/invoices/{invoice_id}/pay",
