@@ -175,5 +175,50 @@ class MarkPaidSwitchTest(unittest.TestCase):
         self.assertEqual(requests, [])
 
 
+def _company(id_, name, contact_type="supplier", record_state="active"):
+    # Voller Datensatz wie in der API — die Zusatzfelder dürfen nicht durchgereicht werden.
+    return {
+        "type": "company", "id": id_, "name": name, "contact_type": contact_type,
+        "record_state": record_state, "email": "x@example.com", "bank_iban": "DE00",
+        "notes": "lang " * 50,
+    }
+
+
+class SearchSupplierTest(unittest.TestCase):
+    def test_search_supplier_filters_substring_and_reduces_fields(self):
+        pages = {
+            1: [
+                _company(229, "Hetzner Online GmbH"),
+                _company(244, "Anthropic PBC"),
+                _company(300, "Hetzner Kunde AG", contact_type="customer"),
+            ],
+            2: [
+                _company(301, "HETZNER Alt GmbH", record_state="archived"),
+                _company(302, "Mein hetzner-Reseller"),
+            ],
+        }
+        requests = []
+
+        def handler(request):
+            requests.append((request.method, request.url.path, dict(request.url.params)))
+            page = int(request.url.params.get("page", "1"))
+            return httpx.Response(200, json={
+                "type": "list", "page": page, "page_size": 100, "total_pages": 2,
+                "total_entries": 5, "has_more": page < 2, "entries": pages[page],
+            })
+
+        with _mock_api(handler):
+            result = json.loads(asyncio.run(server.papierkram_search_supplier("hETZner")))
+
+        self.assertEqual([r[2].get("page") for r in requests], ["1", "2"])
+        self.assertTrue(all(r[1] == "/api/v1/contact/companies" for r in requests))
+        self.assertTrue(all(r[2].get("page_size") == "100" for r in requests))
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([s["id"] for s in result["suppliers"]], [229, 302])
+        for s in result["suppliers"]:
+            self.assertEqual(set(s), {"id", "name", "contact_type"})
+            self.assertEqual(s["contact_type"], "supplier")
+
+
 if __name__ == "__main__":
     unittest.main()

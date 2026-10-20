@@ -39,7 +39,7 @@ setzt die Nightly.
 
 **Papierkram-Entitäten:**
 - `expense/vouchers` — Pflichtfelder POST: `name`, `provenance`, `line_items[]`; `line_items.amount` = brutto, `vat_rate`; `/documents` (PDF-Upload), `/pay`, `state`
-- `contact/companies` — POST: `name` + `contact_type` ∈ `customer|supplier`; Suche per `?supplier=true` / `?customer=true`
+- `contact/companies` — POST: `name` + `contact_type` ∈ `customer|supplier`; GET kennt nur `page`, `page_size` (≤100), `order_by`/`order_direction` — kein Namens-/Typ-/Aktiv-Filter (Swagger); `search_supplier` liest alle Seiten und filtert im MCP
 - `income/invoices` — Draft, `/pay`, `/cancel`; `income/propositions` (Stammartikel, `per_page=100`)
 
 **`SUPPLIER_MAP`** (harte IDs): Hetzner 229, Anthropic 244, OpenAI 235, Perplexity 238, STRATO 65, Vodafone 226, O2 38, Cursor 256, Skool 232, Papierkram/Odacer 13, Freiraum24 259. `NON_EU_SUPPLIER_IDS={232,235,238,244,256}` → `"foreign"`. Map in Docstrings dupliziert — bei Änderung alle Stellen synchron halten.

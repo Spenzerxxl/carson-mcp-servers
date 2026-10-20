@@ -500,19 +500,47 @@ async def papierkram_open_invoices() -> str:
 async def papierkram_search_supplier(query: str) -> str:
     """Lieferant in Papierkram suchen.
 
-    Durchsucht die Papierkram-Kontaktdatenbank nach Lieferanten.
+    Durchsucht die Papierkram-Kontaktdatenbank nach Lieferanten:
+    Teilstring-Match auf den Namen (Groß-/Kleinschreibung egal), nur aktive
+    Lieferanten. Liefert je Treffer nur id, name und contact_type.
     Bekannte Lieferanten-IDs: Hetzner=229, Anthropic=244, OpenAI=235,
     Perplexity=238, STRATO=65, Vodafone=226, O2=38, Cursor=256,
     Skool=232, Papierkram/Odacer=13, Freiraum24=259.
     """
+    # GET /contact/companies kennt laut Swagger keinen Namens-/Typ-/Aktiv-Filter
+    # (nur page, page_size ≤ 100, order_by) — daher alle Seiten lesen und hier
+    # filtern. 1 API-Credit pro Seite.
+    q = query.strip().lower()
+    out = []
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{PAPIERKRAM_URL}/contact/companies",
-            params={"supplier": "true", "name": query},
-            headers=_headers(),
-        )
-        resp.raise_for_status()
-        return json.dumps(resp.json(), ensure_ascii=False, indent=2)
+        page = 1
+        while True:
+            resp = await client.get(
+                f"{PAPIERKRAM_URL}/contact/companies",
+                params={"page": page, "page_size": 100},
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("entries", [])
+            for it in entries:
+                if it.get("contact_type") != "supplier":
+                    continue
+                if it.get("record_state") != "active":
+                    continue
+                if q not in (it.get("name") or "").lower():
+                    continue
+                out.append(
+                    {
+                        "id": it.get("id"),
+                        "name": it.get("name"),
+                        "contact_type": it.get("contact_type"),
+                    }
+                )
+            if not data.get("has_more") or not entries:
+                break
+            page += 1
+    return json.dumps({"count": len(out), "suppliers": out}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
