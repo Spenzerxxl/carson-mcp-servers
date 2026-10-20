@@ -96,6 +96,37 @@ def _rounded_amount(value: float | Decimal) -> float:
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def _receipt_amount(receipt: dict) -> float | None:
+    for key in ("amount", "gross_amount", "total_amount"):
+        value = receipt.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    line_items = receipt.get("line_items")
+    if isinstance(line_items, list):
+        total = 0.0
+        found_amount = False
+        for item in line_items:
+            if not isinstance(item, dict) or item.get("amount") is None:
+                continue
+            try:
+                total += float(item["amount"])
+                found_amount = True
+            except (TypeError, ValueError):
+                continue
+        if found_amount:
+            return total
+    return None
+
+
+def _heute():
+    """Heutiges Datum — eigene Funktion, damit Tests es festlegen können."""
+    return datetime.now().date()
+
+
 def _provenance_for_supplier(supplier_id: int) -> str:
     if supplier_id in NON_EU_SUPPLIER_IDS:
         return "foreign"
@@ -189,9 +220,13 @@ async def papierkram_find_receipts(
 ) -> str:
     """Unverarbeitete/offene Eingangsbelege (Expense Vouchers) finden.
 
-    Gibt standardmaessig alle unbezahlten Belege zurueck.
-    Sobald Filter oder Pagination aktiv sind, werden alle API-Seiten iteriert und
-    die Ergebnisse client-seitig auf dem vollstaendigen Bestand gefiltert.
+    Es werden immer alle API-Seiten iteriert und die Ergebnisse client-seitig auf
+    dem vollstaendigen Bestand gefiltert (der API-Parameter unpaid filtert nicht).
+
+    unpaid_only=true (Default): nur Belege mit state "unpaid" und record_state
+    "active"; je Beleg nur id, voucher_no, name, supplier (id, name),
+    document_date, due_date, amount (brutto) und state.
+    unpaid_only=false: alle Belege als volle API-Datensaetze.
     """
     def _parse_iso_date(value: str | None) -> datetime | None:
         if not value:
@@ -208,31 +243,6 @@ async def papierkram_find_receipts(
         supplier = receipt.get("supplier")
         if isinstance(supplier, dict) and supplier.get("id") is not None:
             return int(supplier["id"])
-        return None
-
-    def _receipt_amount(receipt: dict) -> float | None:
-        for key in ("amount", "gross_amount", "total_amount"):
-            value = receipt.get(key)
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        line_items = receipt.get("line_items")
-        if isinstance(line_items, list):
-            total = 0.0
-            found_amount = False
-            for item in line_items:
-                if not isinstance(item, dict) or item.get("amount") is None:
-                    continue
-                try:
-                    total += float(item["amount"])
-                    found_amount = True
-                except (TypeError, ValueError):
-                    continue
-            if found_amount:
-                return total
         return None
 
     def _entry_list(data: dict | list) -> list | None:
@@ -257,21 +267,14 @@ async def papierkram_find_receipts(
     if filter_date_from and filter_date_to and filter_date_from > filter_date_to:
         raise ValueError("date_from darf nicht nach date_to liegen")
 
-    has_filters = any(
-        value is not None for value in (supplier_id, date_from, date_to, amount)
-    )
-    has_pagination = limit is not None or offset != 0 or page is not None
-    requires_full_scan = (not unpaid_only) or has_filters or has_pagination
-
     async with httpx.AsyncClient(timeout=30) as client:
         api_page = 1
         all_entries = []
-        first_page_data = None
         pages_fetched = 0
         total_entries_reported = None
 
         while True:
-            params = {"page": api_page} if requires_full_scan else {}
+            params = {"page": api_page}
             if unpaid_only:
                 params["unpaid"] = "true"
 
@@ -282,11 +285,6 @@ async def papierkram_find_receipts(
             )
             resp.raise_for_status()
             data = resp.json()
-
-            if first_page_data is None:
-                first_page_data = data
-                if not requires_full_scan:
-                    return json.dumps(data, ensure_ascii=False, indent=2)
 
             items = _entry_list(data)
             if not isinstance(items, list):
@@ -309,8 +307,30 @@ async def papierkram_find_receipts(
 
             api_page += 1
 
+        candidates = all_entries
+        if unpaid_only:
+            candidates = [
+                receipt for receipt in all_entries
+                if receipt.get("state") == "unpaid"
+                and receipt.get("record_state") == "active"
+            ]
+            # Die Liste liefert laut Swagger VoucherFlat ohne creditor — den
+            # Lieferanten fuer die (wenigen) offenen Belege einzeln nachlesen.
+            for receipt in candidates:
+                creditor = receipt.get("creditor")
+                if isinstance(creditor, dict) and creditor.get("id") is not None:
+                    continue
+                detail_resp = await client.get(
+                    f"{PAPIERKRAM_URL}/expense/vouchers/{receipt['id']}",
+                    headers=_headers(),
+                )
+                detail_resp.raise_for_status()
+                detail_creditor = detail_resp.json().get("creditor")
+                if isinstance(detail_creditor, dict):
+                    receipt["creditor"] = detail_creditor
+
         filtered = []
-        for receipt in all_entries:
+        for receipt in candidates:
             if supplier_id is not None and _receipt_supplier_id(receipt) != supplier_id:
                 continue
             receipt_date = _parse_iso_date(
@@ -336,6 +356,46 @@ async def papierkram_find_receipts(
         paginated = filtered[effective_offset:]
         if limit is not None:
             paginated = paginated[:limit]
+
+        if unpaid_only:
+            slim = []
+            for receipt in paginated:
+                creditor = receipt.get("creditor")
+                if not isinstance(creditor, dict):
+                    creditor = {}
+                slim.append(
+                    {
+                        "id": receipt.get("id"),
+                        "voucher_no": receipt.get("voucher_no"),
+                        "name": receipt.get("name"),
+                        "supplier": {
+                            "id": _receipt_supplier_id(receipt),
+                            "name": creditor.get("name"),
+                        },
+                        "document_date": receipt.get("document_date"),
+                        "due_date": receipt.get("due_date"),
+                        "amount": _receipt_amount(receipt),
+                        "state": receipt.get("state"),
+                    }
+                )
+            result = {
+                "count": len(slim),
+                "filtered_count": len(filtered),
+                "offset": effective_offset,
+                "unpaid_only": True,
+                "api_pages_fetched": pages_fetched,
+                "api_entries_fetched": len(all_entries),
+            }
+            if total_entries_reported is not None:
+                result["total_entries"] = total_entries_reported
+            if amount is not None:
+                result["amount"] = amount
+            if limit is not None:
+                result["limit"] = limit
+            if page is not None:
+                result["page"] = page
+            result["entries"] = slim
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
         if isinstance(data, dict):
             result = dict(data)
@@ -485,15 +545,82 @@ async def papierkram_capture_receipt(
 
 @mcp.tool()
 async def papierkram_open_invoices() -> str:
-    """Offene (unbezahlte) Ausgangsrechnungen auflisten."""
+    """Offene (unbezahlte) Ausgangsrechnungen auflisten.
+
+    Liest alle Seiten von /income/invoices und behaelt nur Rechnungen mit
+    state "unpaid" und record_state "active". Liefert je Rechnung nur id,
+    invoice_no, name, customer (id, name), invoice_date, due_date, total_gross
+    (brutto), state und tage_ueberfaellig (heute minus due_date in Tagen;
+    negativ = noch nicht faellig, null ohne due_date).
+    """
+    # GET /income/invoices kennt laut Swagger keinen Status-Filter (nur page,
+    # page_size ≤ 100, company_id, project_id, document_date_range_*) — daher
+    # alle Seiten lesen und hier filtern. 1 API-Credit pro Seite.
+    heute = _heute()
+    out = []
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{PAPIERKRAM_URL}/income/invoices",
-            params={"status": "outstanding"},
-            headers=_headers(),
-        )
-        resp.raise_for_status()
-        return json.dumps(resp.json(), ensure_ascii=False, indent=2)
+        page = 1
+        open_entries = []
+        while True:
+            resp = await client.get(
+                f"{PAPIERKRAM_URL}/income/invoices",
+                params={"page": page, "page_size": 100},
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("entries", [])
+            for it in entries:
+                if it.get("state") != "unpaid":
+                    continue
+                if it.get("record_state") != "active":
+                    continue
+                open_entries.append(it)
+            if not data.get("has_more") or not entries:
+                break
+            page += 1
+
+        for it in open_entries:
+            customer = it.get("customer")
+            # Die Liste liefert laut Swagger InvoiceFlat ohne customer — fuer die
+            # (wenigen) offenen Rechnungen einzeln nachlesen.
+            if not isinstance(customer, dict) or customer.get("id") is None:
+                detail_resp = await client.get(
+                    f"{PAPIERKRAM_URL}/income/invoices/{it['id']}",
+                    headers=_headers(),
+                )
+                detail_resp.raise_for_status()
+                customer = detail_resp.json().get("customer")
+                if not isinstance(customer, dict):
+                    customer = {}
+            billing = it.get("billing")
+            billing_company = billing.get("company") if isinstance(billing, dict) else None
+            due_date = it.get("due_date")
+            tage_ueberfaellig = None
+            if due_date:
+                faellig = datetime.strptime(due_date[:10], "%Y-%m-%d").date()
+                tage_ueberfaellig = (heute - faellig).days
+            out.append(
+                {
+                    "id": it.get("id"),
+                    "invoice_no": it.get("invoice_no"),
+                    "name": it.get("name"),
+                    "customer": {
+                        "id": customer.get("id"),
+                        "name": customer.get("name") or billing_company,
+                    },
+                    "invoice_date": it.get("document_date"),
+                    "due_date": due_date,
+                    "total_gross": it.get("total_gross"),
+                    "state": it.get("state"),
+                    "tage_ueberfaellig": tage_ueberfaellig,
+                }
+            )
+    return json.dumps(
+        {"count": len(out), "heute": heute.isoformat(), "invoices": out},
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -589,6 +716,104 @@ async def papierkram_mark_paid(
         )
         resp.raise_for_status()
         return json.dumps(resp.json(), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def papierkram_mark_receipt_paid(voucher_id: int, payment_date: str) -> str:
+    """Bestehenden Eingangsbeleg (Expense Voucher) als bezahlt markieren.
+
+    GESCHÄFTSREGEL: Nur nach EXPLIZITER Bestätigung durch Frank!
+    NIEMALS automatisch buchen.
+
+    Liest den Beleg, zahlt ihn mit seinem eigenen Betrag (amount, auf 2 Stellen
+    gerundet) über POST /expense/vouchers/{id}/pay und prüft danach den Status
+    per GET nach (bis zu 3×).
+
+    Ergebnis (JSON): voucher_id, value, verified_state, bezahlt_bestaetigt
+    (state == "paid" laut GET) und ok (= bezahlt_bestaetigt).
+    - 422 mit "Difference reason" von /pay gilt als "bereits bezahlt"
+      (bereits_bezahlt=true, meldung) — keine Exception; die GET-Nachprüfung
+      läuft trotzdem, zeigt sie nicht "paid", kommt ok=false plus warnung.
+    - PAPIERKRAM_MARK_PAID_ERLAUBT aus: kein API-Call, Ergebnis ok=false,
+      mark_paid_ignoriert=true und hinweis.
+    - Andere Fehler (GET des Belegs, /pay, Beleg ohne Betrag) werfen
+      RuntimeError mit status_code und error.
+
+    Args:
+        voucher_id: Beleg-ID aus Papierkram
+        payment_date: Zahlungsdatum (YYYY-MM-DD)
+    """
+    if not _mark_paid_erlaubt():
+        return json.dumps(
+            {
+                "ok": False,
+                "voucher_id": voucher_id,
+                "mark_paid_ignoriert": True,
+                "hinweis": (
+                    "PAPIERKRAM_MARK_PAID_ERLAUBT ist aus — Beleg wurde NICHT als "
+                    "bezahlt markiert, API nicht aufgerufen."
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        voucher_resp = await client.get(
+            f"{PAPIERKRAM_URL}/expense/vouchers/{voucher_id}",
+            headers=_headers(),
+        )
+        if not voucher_resp.is_success:
+            raise RuntimeError(_error_payload(voucher_resp))
+        voucher_amount = _receipt_amount(voucher_resp.json())
+        if voucher_amount is None:
+            raise RuntimeError(
+                f"Beleg {voucher_id} hat keinen Betrag — /pay nicht aufgerufen."
+            )
+        value = _rounded_amount(voucher_amount)
+
+        pay_resp = await client.post(
+            f"{PAPIERKRAM_URL}/expense/vouchers/{voucher_id}/pay",
+            headers=_headers(),
+            json={"payment_date": payment_date, "value": value},
+        )
+        result = {
+            "voucher_id": voucher_id,
+            "value": value,
+            "payment_date": payment_date,
+            "pay_status_code": pay_resp.status_code,
+        }
+        if pay_resp.status_code == 422 and "difference reason" in pay_resp.text.lower():
+            # Ist der Beleg schon bezahlt, weicht value vom offenen Betrag (0) ab
+            # und Papierkram verlangt einen difference_reason → idempotenter Fall.
+            result["bereits_bezahlt"] = True
+            result["meldung"] = "bereits bezahlt (Papierkram: 422 Difference reason)"
+        elif not pay_resp.is_success:
+            raise RuntimeError(_error_payload(pay_resp))
+
+        # /pay ist eventual-consistent — bis zu 3× pollen, bevor wir den Status
+        # festschreiben.
+        state = None
+        verify_resp = None
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(0.5)
+            verify_resp = await client.get(
+                f"{PAPIERKRAM_URL}/expense/vouchers/{voucher_id}",
+                headers=_headers(),
+            )
+            if verify_resp.is_success:
+                state = verify_resp.json().get("state")
+                if state == "paid":
+                    break
+        result["verified_state"] = state
+        result["bezahlt_bestaetigt"] = state == "paid"
+        result["ok"] = result["bezahlt_bestaetigt"]
+        if not result["ok"]:
+            result["warnung"] = (
+                f"Beleg {voucher_id} laut GET nicht bezahlt (state={state!r})."
+            )
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 _TIME_UNIT_DEFAULT_NAMES = {

@@ -220,5 +220,193 @@ class SearchSupplierTest(unittest.TestCase):
             self.assertEqual(s["contact_type"], "supplier")
 
 
+def _list_page(pages, page):
+    return httpx.Response(200, json={
+        "type": "list", "page": page, "page_size": 100, "total_pages": len(pages),
+        "total_entries": sum(len(e) for e in pages.values()),
+        "has_more": page < len(pages), "entries": pages[page],
+    })
+
+
+def _voucher(id_, state="unpaid", record_state="active", creditor=True):
+    # Voller VoucherFlat-Datensatz wie in der API — Zusatzfelder dürfen nicht durch.
+    v = {
+        "type": "expense_voucher", "id": id_, "name": f"Beleg {id_}",
+        "due_date": "2026-10-31", "document_date": "2026-10-01",
+        "description": "lang " * 50, "flagged": False, "provenance": "domestic",
+        "voucher_no": f"B-{id_:05d}", "state": state, "record_state": record_state,
+        "amount": 119.0, "invoice_amount": 0.0, "entertainment_persons": [],
+    }
+    if creditor:
+        v["creditor"] = {"type": "company", "id": 229, "name": "Hetzner Online GmbH",
+                         "contact_type": "supplier", "email": "x@example.com"}
+    return v
+
+
+class FindReceiptsUnpaidTest(unittest.TestCase):
+    def test_find_receipts_unpaid_only_scans_all_pages_slim(self):
+        pages = {
+            1: [_voucher(1), _voucher(2, state="paid")],
+            2: [_voucher(3, record_state="archived"), _voucher(4, creditor=False)],
+        }
+        requests = []
+
+        def handler(request):
+            requests.append((request.method, request.url.path, dict(request.url.params)))
+            if request.url.path == "/api/v1/expense/vouchers":
+                return _list_page(pages, int(request.url.params.get("page", "1")))
+            if request.url.path == "/api/v1/expense/vouchers/4":
+                detail = _voucher(4)
+                detail["creditor"] = {"type": "company", "id": 244, "name": "Anthropic PBC"}
+                return httpx.Response(200, json=detail)
+            return httpx.Response(404)
+
+        with _mock_api(handler):
+            result = json.loads(asyncio.run(server.papierkram_find_receipts(unpaid_only=True)))
+
+        list_pages = [r[2].get("page") for r in requests if r[1] == "/api/v1/expense/vouchers"]
+        self.assertEqual(list_pages, ["1", "2"])
+        self.assertTrue(all(r[0] == "GET" for r in requests))
+        self.assertEqual(result["api_pages_fetched"], 2)
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([r["id"] for r in result["entries"]], [1, 4])
+        for r in result["entries"]:
+            self.assertEqual(
+                set(r),
+                {"id", "voucher_no", "name", "supplier", "document_date", "due_date",
+                 "amount", "state"},
+            )
+            self.assertEqual(set(r["supplier"]), {"id", "name"})
+            self.assertEqual(r["state"], "unpaid")
+            self.assertEqual(r["amount"], 119.0)
+        self.assertEqual(result["entries"][0]["supplier"], {"id": 229, "name": "Hetzner Online GmbH"})
+        self.assertEqual(result["entries"][1]["supplier"], {"id": 244, "name": "Anthropic PBC"})
+
+
+def _invoice(id_, state="unpaid", record_state="active", due_date="2026-10-10"):
+    # Voller InvoiceFlat-Datensatz wie in der API (ohne customer).
+    return {
+        "type": "invoice", "id": id_, "name": f"Rechnung {id_}",
+        "description": "lang " * 50, "document_date": "2026-09-26", "due_date": due_date,
+        "invoice_no": f"RE-{id_:05d}", "state": state, "record_state": record_state,
+        "total_net": 100.0, "total_vat": 19.0, "total_gross": 119.0,
+        "outstanding_amount": "119.0",
+        "billing": {"company": f"Kunde {id_} GmbH", "street": "Dotzheimer Str. 36"},
+    }
+
+
+class OpenInvoicesTest(unittest.TestCase):
+    def test_open_invoices_only_unpaid_active_all_pages(self):
+        pages = {
+            1: [_invoice(10), _invoice(11, state="paid"), _invoice(12, state="draft")],
+            2: [_invoice(13, record_state="archived"), _invoice(14, due_date="2026-10-25")],
+        }
+        requests = []
+
+        def handler(request):
+            requests.append((request.method, request.url.path, dict(request.url.params)))
+            if request.url.path == "/api/v1/income/invoices":
+                return _list_page(pages, int(request.url.params.get("page", "1")))
+            invoice_id = int(request.url.path.rsplit("/", 1)[1])
+            detail = _invoice(invoice_id)
+            detail["customer"] = {"type": "company", "id": 900 + invoice_id,
+                                  "name": f"Kunde {invoice_id} GmbH", "contact_type": "customer"}
+            return httpx.Response(200, json=detail)
+
+        heute = server.datetime(2026, 10, 20).date()
+        with _mock_api(handler), mock.patch.object(server, "_heute", return_value=heute):
+            result = json.loads(asyncio.run(server.papierkram_open_invoices()))
+
+        list_pages = [r[2].get("page") for r in requests if r[1] == "/api/v1/income/invoices"]
+        self.assertEqual(list_pages, ["1", "2"])
+        self.assertTrue(all(r[0] == "GET" for r in requests))
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([i["id"] for i in result["invoices"]], [10, 14])
+        for i in result["invoices"]:
+            self.assertEqual(
+                set(i),
+                {"id", "invoice_no", "name", "customer", "invoice_date", "due_date",
+                 "total_gross", "state", "tage_ueberfaellig"},
+            )
+            self.assertEqual(i["state"], "unpaid")
+            self.assertEqual(i["total_gross"], 119.0)
+            self.assertEqual(i["invoice_date"], "2026-09-26")
+        self.assertEqual(result["invoices"][0]["customer"], {"id": 910, "name": "Kunde 10 GmbH"})
+        self.assertEqual(result["invoices"][0]["tage_ueberfaellig"], 10)
+        self.assertEqual(result["invoices"][1]["tage_ueberfaellig"], -5)
+
+
+def _pay_api(requests, pay_response, voucher_amount=238.004):
+    states = iter(["unpaid", "paid", "paid", "paid"])
+
+    def handler(request):
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.url.path.endswith("/pay"):
+            return pay_response
+        if request.method == "GET":
+            return httpx.Response(200, json={
+                "type": "expense_voucher", "id": 4711, "state": next(states),
+                "record_state": "active", "amount": voucher_amount,
+            })
+        return httpx.Response(404)
+
+    return handler
+
+
+class MarkReceiptPaidTest(unittest.TestCase):
+    def setUp(self):
+        env = {k: v for k, v in os.environ.items() if k != "PAPIERKRAM_MARK_PAID_ERLAUBT"}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_mark_receipt_paid_uses_voucher_amount(self):
+        requests = []
+        with _mock_api(_pay_api(requests, httpx.Response(200, json={"id": 4711}))):
+            result = json.loads(asyncio.run(server.papierkram_mark_receipt_paid(4711, "2026-10-20")))
+        self.assertEqual(requests[0][:2], ("GET", "/api/v1/expense/vouchers/4711"))
+        pay = [r for r in requests if r[1].endswith("/pay")]
+        self.assertEqual(pay, [("POST", "/api/v1/expense/vouchers/4711/pay",
+                                {"payment_date": "2026-10-20", "value": 238.0})])
+        self.assertEqual(requests[-1][:2], ("GET", "/api/v1/expense/vouchers/4711"))
+        self.assertEqual(result["value"], 238.0)
+        self.assertEqual(result["verified_state"], "paid")
+        self.assertIs(result["bezahlt_bestaetigt"], True)
+        self.assertIs(result["ok"], True)
+        self.assertNotIn("bereits_bezahlt", result)
+
+    def test_mark_receipt_paid_422_difference_reason_already_paid(self):
+        requests = []
+        resp_422 = httpx.Response(422, json={
+            "error": "unprocessable_entity", "message": "Difference reason ist kein gültiger Wert",
+        })
+        with _mock_api(_pay_api(requests, resp_422)):
+            result = json.loads(asyncio.run(server.papierkram_mark_receipt_paid(4711, "2026-10-20")))
+        self.assertIs(result["bereits_bezahlt"], True)
+        self.assertIn("bereits bezahlt", result["meldung"])
+        self.assertEqual(result["pay_status_code"], 422)
+        self.assertEqual(requests[-1][:2], ("GET", "/api/v1/expense/vouchers/4711"))
+        self.assertEqual(result["verified_state"], "paid")
+        self.assertIs(result["ok"], True)
+
+    def test_mark_receipt_paid_other_422_raises(self):
+        requests = []
+        resp_422 = httpx.Response(422, json={"message": "Payment date ist ungültig"})
+        with _mock_api(_pay_api(requests, resp_422)):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(server.papierkram_mark_receipt_paid(4711, "2026-10-20"))
+
+    def test_mark_receipt_paid_switch_off_no_pay(self):
+        requests = []
+        with mock.patch.dict(os.environ, {"PAPIERKRAM_MARK_PAID_ERLAUBT": "0"}), \
+                _mock_api(_pay_api(requests, httpx.Response(200, json={}))):
+            result = json.loads(asyncio.run(server.papierkram_mark_receipt_paid(4711, "2026-10-20")))
+        self.assertEqual(requests, [])
+        self.assertIs(result["ok"], False)
+        self.assertIs(result["mark_paid_ignoriert"], True)
+        self.assertIn("PAPIERKRAM_MARK_PAID_ERLAUBT", result["hinweis"])
+
+
 if __name__ == "__main__":
     unittest.main()

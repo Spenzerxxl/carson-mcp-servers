@@ -20,7 +20,7 @@ setzt die Nightly.
 
 - Zwei eigenständige MCP-Server (Python, FastMCP aus `mcp` 1.x, async `httpx`) — reine API-Wrapper, zustandslos.
 - **`rag_mcp`** → Butler-Knowledge-Graph; live via `:8101` nginx-Auth-Proxy (vor `:8100`), Header `X-RAG-Key` aus Env `RAG_KEY`, zentral in `_client()`. Tools: `rag_search|store|update|delete|projects|stats`; Suche via `/api/v1/rag/context` ohne LLM-Call.
-- **`papierkram_mcp`** → `https://frankrath.papierkram.de/api/v1`, Bearer aus Env `PAPIERKRAM_TOKEN`. 9 Tools: `find_receipts`, `capture_receipt`, `open_invoices`, `search_supplier`, `create_supplier`, `mark_paid`, `list_articles`, `create_article`, `create_invoice_draft`.
+- **`papierkram_mcp`** → `https://frankrath.papierkram.de/api/v1`, Bearer aus Env `PAPIERKRAM_TOKEN`. 10 Tools: `find_receipts`, `capture_receipt`, `open_invoices`, `search_supplier`, `create_supplier`, `mark_paid`, `mark_receipt_paid`, `list_articles`, `create_article`, `create_invoice_draft`.
 - Konsument: OpenClaw-Gateway (`~/.openclaw/openclaw.json`, `mcp.servers`). Transport im Repo `stdio`; live papierkram `streamable-http` auf `127.0.0.1:18792`.
 - `rag_mcp` hat keine eigene systemd-Unit — OpenClaw startet ihn als Subprozess.
 
