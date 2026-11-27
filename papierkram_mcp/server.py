@@ -2,10 +2,17 @@
 """MCP Server for Papierkram.de Buchhaltungs-API."""
 
 import asyncio
+import contextlib
+import contextvars
+import fcntl
+import functools
+import logging
 import os
 import json
+import tempfile
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -59,6 +66,309 @@ def _mark_paid_erlaubt() -> bool:
     """
     wert = os.environ.get("PAPIERKRAM_MARK_PAID_ERLAUBT", "").strip().lower()
     return wert not in _MARK_PAID_AUS_WERTE
+
+
+# --- Kontingent-Schutz -------------------------------------------------------
+# Papierkram rechnet jeden API-Request gegen ein Monatskontingent ab (Default
+# 10.000 Credits, Auffuellung zum Monatsersten). 429-Antworten tragen keine
+# Quota-Header (Befund 26.07. und 26.11.2026) — darum zaehlt der Server selbst.
+# Jeder Request laeuft ueber _client(); dessen Event-Hooks zaehlen, erkennen
+# "quota exceeded" und setzen die Sperre. Jedes Tool traegt zusaetzlich
+# @_kontingent_geschuetzt, das die Sperre VOR dem ersten Request prueft.
+#
+# Zustand: eine JSON-Datei AUSSERHALB des Repos (PAPIERKRAM_QUOTA_DATEI,
+# Default ~/.local/state/papierkram-mcp/quota.json), atomar geschrieben, erst
+# beim ersten Request angelegt. Datei von Hand loeschen = Sperre aufheben.
+# Alle Env-Werte werden erst beim Aufruf gelesen, nicht beim Import.
+
+_TZ_BERLIN = ZoneInfo("Europe/Berlin")
+_QUOTA_DATEI_DEFAULT = "~/.local/state/papierkram-mcp/quota.json"
+_MONATSBUDGET_DEFAULT = 10000
+_MONATSNAMEN = (
+    "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+)
+
+_log = logging.getLogger("papierkram_mcp.kontingent")
+
+# Gesetzt, solange ein Tool-Aufruf laeuft, der die Sperrpruefung bereits
+# bestanden hat. Wird die Sperre MITTEN in diesem Aufruf gesetzt (429 auf
+# Request n), laufen dessen Folge-Requests unveraendert weiter und bekommen
+# von Papierkram selbst 429 — so bleiben Ablauf und Rueckgabe der Schreib-Tools
+# gleich (z.B. capture_receipt meldet einen bereits angelegten Beleg weiter).
+# Jeder NEUE Tool-Aufruf wird dagegen sofort ohne Request abgewiesen.
+_im_geprueften_aufruf = contextvars.ContextVar("_im_geprueften_aufruf", default=False)
+
+
+class PapierkramKontingentGesperrt(RuntimeError):
+    """Kontingent-Sperre aktiv — es wurde kein Request an Papierkram gesendet."""
+
+
+def _jetzt() -> datetime:
+    """Aktuelle Zeit in Europe/Berlin — eigene Funktion, damit Tests sie festlegen."""
+    return datetime.now(_TZ_BERLIN)
+
+
+def _quota_pfad() -> str:
+    """Pfad der Zaehler-/Sperrdatei (PAPIERKRAM_QUOTA_DATEI), beim Aufruf gelesen."""
+    roh = os.environ.get("PAPIERKRAM_QUOTA_DATEI", "").strip()
+    return os.path.expanduser(roh or _QUOTA_DATEI_DEFAULT)
+
+
+def _monatsbudget() -> int:
+    """PAPIERKRAM_MONATSBUDGET (Credits je Kalendermonat), Default 10000."""
+    roh = os.environ.get("PAPIERKRAM_MONATSBUDGET", "").strip()
+    if not roh:
+        return _MONATSBUDGET_DEFAULT
+    try:
+        wert = int(roh)
+    except ValueError:
+        wert = 0
+    if wert < 1:
+        _log.warning(
+            "PAPIERKRAM_MONATSBUDGET=%r ungueltig — nutze Default %d",
+            roh, _MONATSBUDGET_DEFAULT,
+        )
+        return _MONATSBUDGET_DEFAULT
+    return wert
+
+
+def _warnschwelle(budget: int) -> int:
+    """80 % des Budgets, aufgerundet auf ganze Requests."""
+    return -(-budget * 4 // 5)
+
+
+def _berlin(zeit: datetime) -> datetime:
+    return zeit.astimezone(_TZ_BERLIN)
+
+
+def _monat_schluessel(zeit: datetime) -> str:
+    zeit = _berlin(zeit)
+    return f"{zeit.year:04d}-{zeit.month:02d}"
+
+
+def _monat_label(zeit: datetime) -> str:
+    zeit = _berlin(zeit)
+    return f"{_MONATSNAMEN[zeit.month - 1]} {zeit.year}"
+
+
+def _naechster_monatserster(zeit: datetime) -> datetime:
+    zeit = _berlin(zeit)
+    jahr, monat = (zeit.year + 1, 1) if zeit.month == 12 else (zeit.year, zeit.month + 1)
+    return datetime(jahr, monat, 1, tzinfo=_TZ_BERLIN)
+
+
+def _zustand_lesen(pfad: str) -> dict:
+    """Zustand lesen; fehlende Datei = leerer Zustand (Datei wird NICHT angelegt)."""
+    try:
+        with open(pfad, encoding="utf-8") as fh:
+            zustand = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        _log.error("Kontingent-Datei %s unlesbar (%s) — behandle als leer", pfad, exc)
+        return {}
+    return zustand if isinstance(zustand, dict) else {}
+
+
+def _zustand_schreiben(pfad: str, zustand: dict) -> None:
+    """Atomar schreiben: Temp-Datei im selben Verzeichnis, fsync, os.replace."""
+    verzeichnis = os.path.dirname(pfad) or "."
+    fd, tmp = tempfile.mkstemp(dir=verzeichnis, prefix=".quota-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(zustand, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, pfad)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def _zustand_exklusiv(pfad: str):
+    """Prozessuebergreifend exklusiv (flock auf das Verzeichnis, keine Extra-Datei)."""
+    verzeichnis = os.path.dirname(pfad) or "."
+    os.makedirs(verzeichnis, exist_ok=True)
+    dir_fd = os.open(verzeichnis, os.O_RDONLY)
+    try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(dir_fd)
+
+
+def _aktive_sperre(zustand: dict, jetzt: datetime) -> datetime | None:
+    roh = zustand.get("sperre_bis")
+    if not roh:
+        return None
+    try:
+        bis = datetime.fromisoformat(roh)
+    except (TypeError, ValueError):
+        _log.error("Kontingent-Datei: sperre_bis=%r unlesbar — ignoriert", roh)
+        return None
+    if bis.tzinfo is None:
+        bis = bis.replace(tzinfo=_TZ_BERLIN)
+    return bis if jetzt < bis else None
+
+
+def _zustand_fuer_monat(zustand: dict, jetzt: datetime) -> dict:
+    """Beim Monatswechsel Zaehler und Warn-Merker zuruecksetzen."""
+    monat = _monat_schluessel(jetzt)
+    if zustand.get("monat") == monat:
+        return zustand
+    neu = {"monat": monat, "zaehler": 0, "warnung_gesendet": False}
+    sperre = _aktive_sperre(zustand, jetzt)
+    if sperre is not None:
+        neu["sperre_bis"] = sperre.isoformat()
+        neu["sperre_gesetzt_am"] = zustand.get("sperre_gesetzt_am")
+    return neu
+
+
+def _sperrmeldung(sperre_bis: datetime) -> str:
+    sperre_bis = _berlin(sperre_bis)
+    gesperrter_monat = sperre_bis - timedelta(days=1)
+    return (
+        f"Papierkram-Kontingent für {_monat_label(gesperrter_monat)} erschöpft, "
+        f"wieder ab {sperre_bis:%d.%m.} "
+        "Es wurde keine Anfrage an Papierkram gesendet."
+    )
+
+
+def _sperre_pruefen() -> None:
+    """Wirft PapierkramKontingentGesperrt, wenn die Sperre aktiv ist."""
+    sperre = _aktive_sperre(_zustand_lesen(_quota_pfad()), _jetzt())
+    if sperre is not None:
+        raise PapierkramKontingentGesperrt(_sperrmeldung(sperre))
+
+
+def _kontingent_warnung_melden(monat: str, zaehler: int, budget: int) -> None:
+    """80-%-Warnung (einmal je Monat).
+
+    Ein Push an Frank ist aus papierkram-mcp.service heraus nicht sauber
+    ausloesbar: der Workspace-Push-Weg (ki-mitarbeiter/push-mcp.py ->
+    127.0.0.1:3021/api/push/ausloesen) braucht PUSH_CREDENTIALS_FILE und
+    PUSH_BENUTZER aus einer eigenen systemd-Unit; beides hat dieser Dienst
+    nicht. Darum bewusst nur eine Logzeile (Rueckfrage an Frank offen).
+    """
+    _log.warning(
+        "PAPIERKRAM-KONTINGENT-WARNUNG %s: %d von %d Credits verbraucht (>= 80 %%). "
+        "Push an Frank NICHT ausgeloest (kein Push-Weg aus papierkram-mcp konfiguriert).",
+        monat, zaehler, budget,
+    )
+
+
+def _request_zaehlen() -> None:
+    """Zaehlt einen ausgehenden Request; loest ggf. die 80-%-Warnung aus.
+
+    Ist die Datei nicht schreibbar, wird das geloggt und der Request geht
+    trotzdem raus — der Zaehler darf die Buchhaltung nicht lahmlegen.
+    """
+    pfad = _quota_pfad()
+    jetzt = _jetzt()
+    budget = _monatsbudget()
+    warnung = None
+    try:
+        with _zustand_exklusiv(pfad):
+            zustand = _zustand_fuer_monat(_zustand_lesen(pfad), jetzt)
+            try:
+                zaehler = int(zustand.get("zaehler", 0)) + 1
+            except (TypeError, ValueError):
+                zaehler = 1
+            zustand["zaehler"] = zaehler
+            zustand["aktualisiert"] = jetzt.isoformat()
+            if zaehler >= _warnschwelle(budget) and not zustand.get("warnung_gesendet"):
+                # Merker VOR dem Melden persistieren: hoechstens einmal je Monat.
+                zustand["warnung_gesendet"] = True
+                zustand["warnung_am"] = jetzt.isoformat()
+                warnung = (zustand["monat"], zaehler, budget)
+            _zustand_schreiben(pfad, zustand)
+    except OSError as exc:
+        _log.error("Kontingent-Zaehler %s nicht schreibbar: %s", pfad, exc)
+        return
+    if warnung is not None:
+        _kontingent_warnung_melden(*warnung)
+
+
+def _sperre_setzen() -> datetime:
+    """Persistierte Sperre bis zum naechsten Monatsersten 00:00 Europe/Berlin."""
+    pfad = _quota_pfad()
+    jetzt = _jetzt()
+    bis = _naechster_monatserster(jetzt)
+    try:
+        with _zustand_exklusiv(pfad):
+            zustand = _zustand_fuer_monat(_zustand_lesen(pfad), jetzt)
+            if _aktive_sperre(zustand, jetzt) == bis:
+                return bis  # schon gesperrt (Folge-429 im selben Aufruf)
+            zustand["sperre_bis"] = bis.isoformat()
+            zustand["sperre_gesetzt_am"] = jetzt.isoformat()
+            zustand["aktualisiert"] = jetzt.isoformat()
+            _zustand_schreiben(pfad, zustand)
+    except OSError as exc:
+        _log.error("Kontingent-Sperre konnte nicht in %s gespeichert werden: %s", pfad, exc)
+        return bis
+    _log.warning(
+        "PAPIERKRAM-KONTINGENT-SPERRE gesetzt (429 quota exceeded) bis %s — "
+        "keine weiteren Requests. Aufheben: %s loeschen.",
+        bis.isoformat(), pfad,
+    )
+    return bis
+
+
+async def _vor_request(request: httpx.Request) -> None:
+    if not _im_geprueften_aufruf.get():
+        _sperre_pruefen()
+    _request_zaehlen()
+
+
+async def _nach_response(response: httpx.Response) -> None:
+    if response.status_code != 429:
+        return
+    await response.aread()
+    if "quota exceeded" in response.text.lower():
+        _sperre_setzen()
+    else:
+        _log.warning("Papierkram 429 ohne 'quota exceeded' — keine Sperre gesetzt")
+
+
+def _client(timeout: float = 30) -> httpx.AsyncClient:
+    """Einziger Weg zu Papierkram: AsyncClient mit Zaehl-/Sperr-Hooks.
+
+    Ruft httpx.AsyncClient nur mit Keyword-Argumenten auf (Tests patchen ihn).
+    """
+    return httpx.AsyncClient(
+        timeout=timeout,
+        event_hooks={"request": [_vor_request], "response": [_nach_response]},
+    )
+
+
+def _kontingent_geschuetzt(fn):
+    """Tool-Guard: Sperre zuerst pruefen, vor jedem Request.
+
+    Wird die Sperre waehrend des Aufrufs gesetzt und endet das Tool mit einer
+    Exception, kommt statt des rohen 429 die klare Sperrmeldung.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        _sperre_pruefen()
+        token = _im_geprueften_aufruf.set(True)
+        try:
+            return await fn(*args, **kwargs)
+        except PapierkramKontingentGesperrt:
+            raise
+        except Exception as exc:
+            sperre = _aktive_sperre(_zustand_lesen(_quota_pfad()), _jetzt())
+            if sperre is not None:
+                raise PapierkramKontingentGesperrt(_sperrmeldung(sperre)) from exc
+            raise
+        finally:
+            _im_geprueften_aufruf.reset(token)
+
+    wrapper._kontingent_geschuetzt = True
+    return wrapper
 
 
 def _normalize_vat_rate(vat_rate: str) -> str:
@@ -208,6 +518,7 @@ def _error_payload(resp: httpx.Response) -> str:
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_find_receipts(
     supplier_id: int | None = None,
     date_from: str | None = None,
@@ -267,7 +578,7 @@ async def papierkram_find_receipts(
     if filter_date_from and filter_date_to and filter_date_from > filter_date_to:
         raise ValueError("date_from darf nicht nach date_to liegen")
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         api_page = 1
         all_entries = []
         pages_fetched = 0
@@ -428,6 +739,7 @@ async def papierkram_find_receipts(
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_capture_receipt(
     name: str,
     supplier_id: int,
@@ -478,7 +790,7 @@ async def papierkram_capture_receipt(
     )
     line_item_amount = payload["line_items"][0]["amount"]
 
-    async with _voucher_create_lock, httpx.AsyncClient(timeout=30) as client:
+    async with _voucher_create_lock, _client() as client:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/expense/vouchers",
             headers=_headers(),
@@ -544,6 +856,7 @@ async def papierkram_capture_receipt(
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_open_invoices() -> str:
     """Offene (unbezahlte) Ausgangsrechnungen auflisten.
 
@@ -558,7 +871,7 @@ async def papierkram_open_invoices() -> str:
     # alle Seiten lesen und hier filtern. 1 API-Credit pro Seite.
     heute = _heute()
     out = []
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         page = 1
         open_entries = []
         while True:
@@ -624,6 +937,7 @@ async def papierkram_open_invoices() -> str:
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_search_supplier(query: str) -> str:
     """Lieferant in Papierkram suchen.
 
@@ -639,7 +953,7 @@ async def papierkram_search_supplier(query: str) -> str:
     # filtern. 1 API-Credit pro Seite.
     q = query.strip().lower()
     out = []
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         page = 1
         while True:
             resp = await client.get(
@@ -671,13 +985,14 @@ async def papierkram_search_supplier(query: str) -> str:
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_create_supplier(name: str) -> str:
     """Neuen Lieferanten in Papierkram anlegen.
 
     GESCHÄFTSREGEL: IMMER Frank fragen bevor ein neuer Lieferant angelegt wird!
     NIEMALS automatisch anlegen.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/contact/companies",
             headers=_headers(),
@@ -689,6 +1004,7 @@ async def papierkram_create_supplier(name: str) -> str:
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_mark_paid(
     invoice_id: int, payment_date: str, amount: float
 ) -> str:
@@ -708,7 +1024,7 @@ async def papierkram_mark_paid(
             "papierkram_mark_paid gesperrt: PAPIERKRAM_MARK_PAID_ERLAUBT ist aus — "
             "keine Zahlung gebucht, API nicht aufgerufen."
         )
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/income/invoices/{invoice_id}/pay",
             headers=_headers(),
@@ -719,6 +1035,7 @@ async def papierkram_mark_paid(
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_mark_receipt_paid(voucher_id: int, payment_date: str) -> str:
     """Bestehenden Eingangsbeleg (Expense Voucher) als bezahlt markieren.
 
@@ -758,7 +1075,7 @@ async def papierkram_mark_receipt_paid(voucher_id: int, payment_date: str) -> st
             indent=2,
         )
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         voucher_resp = await client.get(
             f"{PAPIERKRAM_URL}/expense/vouchers/{voucher_id}",
             headers=_headers(),
@@ -826,6 +1143,7 @@ _TIME_UNIT_DEFAULT_NAMES = {
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_list_articles(
     proposition_type: str | None = None,
     name_query: str | None = None,
@@ -838,7 +1156,7 @@ async def papierkram_list_articles(
         name_query: Substring-Suche im Namen (Client-seitig, case-insensitive).
         include_archived: True → auch archivierte Artikel zurückgeben (Default: nur active).
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         resp = await client.get(
             f"{PAPIERKRAM_URL}/income/propositions",
             params={"per_page": 100},
@@ -864,6 +1182,7 @@ async def papierkram_list_articles(
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_create_article(
     name: str,
     price: float,
@@ -907,7 +1226,7 @@ async def papierkram_create_article(
         "unit_name_n": unit_name_n or default_n,
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _client() as client:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/income/propositions",
             headers=_headers(),
@@ -931,6 +1250,7 @@ async def papierkram_create_article(
 
 
 @mcp.tool()
+@_kontingent_geschuetzt
 async def papierkram_create_invoice_draft(
     customer_company_id: int,
     items: list[dict],
@@ -998,7 +1318,7 @@ async def papierkram_create_invoice_draft(
     if notes:
         payload["description"] = notes
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with _client(timeout=60) as client:
         resp = await client.post(
             f"{PAPIERKRAM_URL}/income/invoices",
             headers=_headers(),

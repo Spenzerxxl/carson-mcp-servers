@@ -18,6 +18,28 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import server  # noqa: E402
 
+import tempfile  # noqa: E402
+
+# Kontingent-Zustand (Zaehler/Sperre) NIE in die echte Datei unter ~/.local/state
+# schreiben: _quota_pfad wird fuer das ganze Modul auf ein Temp-Verzeichnis
+# gepatcht — das greift auch in Tests, die os.environ mit clear=True leeren.
+_QUOTA_TMP = None
+_QUOTA_PATCH = None
+
+
+def setUpModule():
+    global _QUOTA_TMP, _QUOTA_PATCH
+    _QUOTA_TMP = tempfile.TemporaryDirectory(prefix="papierkram-quota-test-")
+    pfad = os.path.join(_QUOTA_TMP.name, "quota.json")
+    _QUOTA_PATCH = mock.patch.object(server, "_quota_pfad", return_value=pfad)
+    _QUOTA_PATCH.start()
+
+
+def tearDownModule():
+    _QUOTA_PATCH.stop()
+    _QUOTA_TMP.cleanup()
+
+
 ANTHROPIC = 244
 STRATO = 65
 
